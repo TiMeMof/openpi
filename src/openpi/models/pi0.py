@@ -146,7 +146,8 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
-        # TODO: rewrite gemma in NNX. For now, use bridge.
+        # 创建并初始化语言模型
+        # TODO: 用NNX重写Gemma，目前使用桥接
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
                 configs=[paligemma_config, action_expert_config],
@@ -154,6 +155,8 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init")
+
+        # 创建并初始化图像模型
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -164,11 +167,22 @@ class Pi0(_model.BaseModel):
             )
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        # 组合LLM和图像模型为PaLI-Gemma多模态模型
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        
+        # 状态投影层：将机器人状态投影到模型维度
         self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        
+        # 动作输入投影层：将动作投影到模型维度
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        
+        # 动作-时间MLP输入层：将连接的动作和时间特征投影到模型维度
         self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
+        
+        # 动作-时间MLP输出层
         self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        
+        # 动作输出投影层：将模型输出投影回动作维度
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
     @at.typecheck
