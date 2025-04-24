@@ -185,6 +185,7 @@ class Pi0(_model.BaseModel):
         # 动作输出投影层：将模型输出投影回动作维度
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+    # 处理图像和文本输入(图像通过SigLip模型编码，文本通过Gemma LLM编码)，创建前缀 token，皆为双向注意力，用ar_mask = false表示
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
@@ -192,43 +193,56 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        # embed images
+        # 嵌入图像
         for name in obs.images:
+            # 通过图像模型获取图像token
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
+            # 添加图像token
             tokens.append(image_tokens)
+            # 重复图像掩码以匹配token维度
+            # 将图像掩码扩展到与图像tokens相同的序列长度，使用einops.repeat进行形状变换，
+            # 这些掩码会指示哪些图像是有效的，而哪些是填充的
             input_mask.append(
                 einops.repeat(
                     obs.image_masks[name],
-                    "b -> b s",
-                    s=image_tokens.shape[1],
+                    "b -> b s", # 调整形状：批次维度保持不变，添加序列维度
+                    s=image_tokens.shape[1], # 序列长度等于图像token数
                 )
             )
-            # image tokens attend to each other
+            # 设置图像tokens之间的注意力为双向(False表示双向注意力)，原因在于图像内容通常是非时序性的数据
+            # 为什么非时序性的数据可以使用双向注意力？因为图像数据通常是静态的，不具有时间序列的特性，
+            # 因此可以在处理时考虑全局上下文信息，而不需要限制为单向的时间序列处理。
             ar_mask += [False] * image_tokens.shape[1]
 
-        # add language (aka tokenized inputs)
-        if obs.tokenized_prompt is not None:
+        # 使用LLM模型对文本输入 tokenized_inputs 进行嵌入 
+        if obs.tokenized_prompt is not None:# 通过语言模型嵌入分词后的提示
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
-            tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
-            # full attention between image and language inputs
+            tokens.append(tokenized_inputs)# 添加文本token
+            input_mask.append(obs.tokenized_prompt_mask)# 添加提示掩码
+            # 同样设置为双向注意力，相当于语言token可以关注图像token，图像token反过来亦可关注语言token，最终实现多模态融合
             ar_mask += [False] * tokenized_inputs.shape[1]
+#     连接所有token和掩码，其中包含了
+# ->  多模态信息的融合表示tokens——图像token和语言token
+# ->  以及指示哪些token是有效信息的 input_mask
+# ->  和如何在这些token之间进行注意力计算规则的 ar_mask ——相当于控制信息流动的方向 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
+    # 处理机器人状态信息q_t、噪声化的动作信息noise(状态和噪声动作经过线性投影和MLP处理)，创建后缀 token
     @at.typecheck
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
-        input_mask = []
-        ar_mask = []
-        tokens = []
-        # add a single state token
-        state_token = self.state_proj(obs.state)[:, None, :]
-        tokens.append(state_token)
+        """嵌入后缀部分（状态和动作）"""
+        input_mask = [] # 
+        ar_mask = []    # 自回归掩码
+        tokens = []     # tokens 列表
+        # 添加单个状态 token
+        state_token = self.state_proj(obs.state)[:, None, :] # 投影状态并且添加一个维度
+        tokens.append(state_token) # 添加状态 token
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         # image/language inputs do not attend to state or actions
         ar_mask += [True]

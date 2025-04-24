@@ -24,6 +24,8 @@ from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import tensorflow_datasets as tfds
 import tyro
+import h5py
+from pathlib import Path
 
 REPO_NAME = "your_hf_username/libero"  # Name of the output dataset, also used for the Hugging Face Hub
 RAW_DATASET_NAMES = [
@@ -32,6 +34,31 @@ RAW_DATASET_NAMES = [
     "libero_object_no_noops",
     "libero_spatial_no_noops",
 ]  # For simplicity we will combine multiple Libero datasets into one training dataset
+
+def load_hdf5_data(data_dir: str, dataset:LeRobotDataset):
+    """
+    加载 HDF5 文件并将数据写入 LeRobot 数据集。
+    """
+    hdf5_files = list(Path(data_dir).glob("*.hdf5"))
+    if not hdf5_files:
+        raise FileNotFoundError(f"No .hdf5 files found in {data_dir}")
+    
+    for hdf5_file in hdf5_files:
+        with h5py.File(hdf5_file, "r") as f:
+            print(f"Processing file: {hdf5_file}")
+            for episode_name in f.keys():
+                episode = f[episode_name]
+                for step in range(len(episode["steps"])):
+                    step_data = episode["steps"][step]
+                    dataset.add_frame(
+                        {
+                            "image": step_data["observation"]["image"],
+                            "wrist_image": step_data["observation"]["wrist_image"],
+                            "state": step_data["observation"]["state"],
+                            "actions": step_data["action"],
+                        }
+                    )
+                dataset.save_episode(task=episode.attrs["language_instruction"])
 
 
 def main(data_dir: str, *, push_to_hub: bool = False):
@@ -88,6 +115,8 @@ def main(data_dir: str, *, push_to_hub: bool = False):
                     }
                 )
             dataset.save_episode(task=step["language_instruction"].decode())
+
+    # load_hdf5_data(data_dir, dataset)
 
     # Consolidate the dataset, skip computing stats since we will do that later
     dataset.consolidate(run_compute_stats=False)

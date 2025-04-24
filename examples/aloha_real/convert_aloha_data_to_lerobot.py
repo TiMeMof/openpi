@@ -34,7 +34,7 @@ DEFAULT_DATASET_CONFIG = DatasetConfig()
 def create_empty_dataset(
     repo_id: str,
     robot_type: str,
-    mode: Literal["video", "image"] = "video",
+    mode: Literal["video", "image"] = "image",
     *,
     has_velocity: bool = False,
     has_effort: bool = False,
@@ -57,11 +57,10 @@ def create_empty_dataset(
         "left_gripper",
     ]
     cameras = [
-        "cam_high",
-        "cam_low",
-        "cam_left_wrist",
-        "cam_right_wrist",
-    ]
+                "top",
+                "left_wrist",
+                "right_wrist",
+            ],
 
     features = {
         "observation.state": {
@@ -98,16 +97,43 @@ def create_empty_dataset(
             ],
         }
 
-    for cam in cameras:
-        features[f"observation.images.{cam}"] = {
-            "dtype": mode,
-            "shape": (3, 480, 640),
-            "names": [
-                "channels",
-                "height",
-                "width",
-            ],
-        }
+    # for cam in cameras:
+    #     features[f"observation.images.{cam}"] = {
+    #         "dtype": mode,
+    #         "shape": (3, 480, 640),
+    #         "names": [
+    #             "channels",
+    #             "height",
+    #             "width",
+    #         ],
+    #     }
+    features[f"observation.images.top"] = {
+        "dtype": mode,
+        "shape": (480, 640, 3),
+        "names": [
+            "channels",
+            "height",
+            "width",
+        ],
+    }    
+    features[f"observation.images.left_wrist"] = {
+        "dtype": mode,
+        "shape": (480, 640, 3),
+        "names": [
+            "channels",
+            "height",
+            "width",
+        ],
+    }    
+    features[f"observation.images.right_wrist"] = {
+        "dtype": mode,
+        "shape": (480, 640, 3),
+        "names": [
+            "channels",
+            "height",
+            "width",
+        ],
+    }
 
     if Path(LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(LEROBOT_HOME / repo_id)
@@ -180,10 +206,9 @@ def load_raw_episode_data(
         imgs_per_cam = load_raw_images_per_camera(
             ep,
             [
-                "cam_high",
-                "cam_low",
-                "cam_left_wrist",
-                "cam_right_wrist",
+                "top",
+                "left_wrist",
+                "right_wrist",
             ],
         )
 
@@ -228,9 +253,9 @@ def populate_dataset(
 
 def port_aloha(
     raw_dir: Path,
-    repo_id: str,
+    repo_id: str = "aloha/Test",
     raw_repo_id: str | None = None,
-    task: str = "DEBUG",
+    task: str = "grip the cube",
     *,
     episodes: list[int] | None = None,
     push_to_hub: bool = True,
@@ -264,8 +289,8 @@ def port_aloha(
     )
     dataset.consolidate()
 
-    if push_to_hub:
-        dataset.push_to_hub()
+    # if push_to_hub:
+    #     dataset.push_to_hub()
 
 
 if __name__ == "__main__":
