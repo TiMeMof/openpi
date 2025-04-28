@@ -185,11 +185,11 @@ class Pi0(_model.BaseModel):
         # 动作输出投影层：将模型输出投影回动作维度
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-    # 处理图像和文本输入(图像通过SigLip模型编码，文本通过Gemma LLM编码)，创建前缀 token，皆为双向注意力，用ar_mask = false表示
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        """嵌入前缀部分（图像和文本），图像通过SigLip模型编码，文本通过Gemma LLM编码，皆为双向注意力，用ar_mask = false表示"""
         input_mask = []
         ar_mask = []
         tokens = []
@@ -231,91 +231,142 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
-    # 处理机器人状态信息q_t、噪声化的动作信息noise(状态和噪声动作经过线性投影和MLP处理)，创建后缀 token
+
     @at.typecheck
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
-        """嵌入后缀部分（状态和动作）"""
+        """嵌入后缀部分（状态和动作），处理机器人状态信息q_t、噪声化的动作信息noise(状态和噪声动作经过线性投影和MLP处理)，创建后缀 token"""
         input_mask = [] # 
         ar_mask = []    # 自回归掩码
         tokens = []     # tokens 列表
         # 添加单个状态 token
         state_token = self.state_proj(obs.state)[:, None, :] # 投影状态并且添加一个维度
         tokens.append(state_token) # 添加状态 token
+        # 添加状态掩码（全为1），表示这个状态token是有效的
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+        # 设置为单向注意力(True)，表明图像和语言输入不能关注状态信息
         # image/language inputs do not attend to state or actions
         ar_mask += [True]
 
+        # 时间步嵌入，使用正弦-余弦位置编码生成时间步嵌入，敏感度范围为[0, 1]
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        
+        ''' 动作和时间信息融合，比如通过action_time_tokens连接：「带噪声的动作」和「时间token」'''
         # mix timestep + action information using an MLP
-        action_tokens = self.action_in_proj(noisy_actions)
+        # 混合时间步 + 动作信息，使用MLP
+        action_tokens = self.action_in_proj(noisy_actions)# 投影带噪声的动作
+        
+        # 重复时间嵌入以匹配动作序列长度
         time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+        
+        # 连接动作和时间token
         action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
-        action_time_tokens = self.action_time_mlp_in(action_time_tokens)
-        action_time_tokens = nnx.swish(action_time_tokens)
-        action_time_tokens = self.action_time_mlp_out(action_time_tokens)
+        
+        ''' MLP 处理 '''
+        # 两层MLP和swish激活函数对「动作和时间的组合表示」进行非线性变换，以进一步融合：(噪声)动作和时间信息 
+        action_time_tokens = self.action_time_mlp_in(action_time_tokens)    # 输入层
+        action_time_tokens = nnx.swish(action_time_tokens)                  # swish激活函数
+        action_time_tokens = self.action_time_mlp_out(action_time_tokens)   # 输出层
+        
+        # 添加动作-时间 token
         tokens.append(action_time_tokens)
+        # 添加动作-时间掩码（全为1），表示这个动作-时间 token 是有效的
+        # 这里的掩码是为了指示哪些 token 是有效的，通常情况下，动作-时间 token 是有效的
         input_mask.append(jnp.ones(action_time_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
+        # 图像/语言/状态输入不关注动作token，设置为单向注意力(True)
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
-        tokens = jnp.concatenate(tokens, axis=1)
-        input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask
+        
+        # 连接所有token和掩码
+        tokens = jnp.concatenate(tokens, axis=1)        # 在序列维度上连接所有token
+        input_mask = jnp.concatenate(input_mask, axis=1)# 在序列维度上连接所有掩码
+        ar_mask = jnp.array(ar_mask)                    # 将自回归掩码转换为布尔数组
+        return tokens, input_mask, ar_mask  # 返回tokens、输入掩码和自回归掩码  
 
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        """计算扩散模型的损失函数"""
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        # 分割随机数生成器为三部分，用于不同的随机操作
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
+        # 获取动作的批次形状
         batch_shape = actions.shape[:-2]
+        # 生成与动作形状相同的噪声
         noise = jax.random.normal(noise_rng, actions.shape)
+        # jax.random.beta(key, a, b, shape) 
+        # beta分布：x^(a-1) * (1-x)^(b-1)，x ~ Beta(a, b)，在[0, 1]区间内
+        # Beta(1.5, 1)偏向较低的值
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        # 拓展时间维度以匹配动作形状
         time_expanded = time[..., None, None]
+        # x_t是噪声化的动作，随着时间从 0 到 1 ，原始动作action逐渐添加真实噪声u_t，变为纯噪声 noise
+        # 而 u_t 代表所加的真实噪声，便是咱们所要预测噪声 v_t 的ground truth
+        # 创建带噪声的动作 x_t = t*noise + (1 - t)*actions
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+        # 计算目标噪声 u_t = noise - actions, 这是模型需要预测的目标
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
+        
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)
+        # 通过链接前缀和后缀的掩码，创建完整的输入序列
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        # 创建注意力掩码，从而控制不同token之间的可见性
         attn_mask = make_attn_mask(input_mask, ar_mask)
+        # 计算位置编码
         positions = jnp.cumsum(input_mask, axis=1) - 1
+        # 通过PaLI-Gemma模型处理tokens，得到前缀和后缀的输出
+        # 这里的prefix_out是None，因为我们只关心后缀的输出
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
         )
+
+        # 预测噪声v_t，将模型输出的后缀部分投影到动作维度
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+        # 返回预测噪声和真实噪声之间的均方误差
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
     @override
     def sample_actions(
         self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation,
+        rng: at.KeyArrayLike,                       # 随机数生成器
+        observation: _model.Observation,            # 观察数据，包括文本和图像
         *,
-        num_steps: int | at.Int[at.Array, ""] = 10,
-    ) -> _model.Actions:
+        num_steps: int | at.Int[at.Array, ""] = 10, # 扩散步骤数
+    ) -> _model.Actions:                            # 返回生成的动作
+        """基于扩散模型逆向采样(即去噪)，生成机器人动作序列 """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
+        # 注意：这里使用扩散模型文献中更常见的约定，t=1是噪声，t=0是目标分布
+        # 这与pi0论文相反
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+        # 生成初始噪声，形状为[批次大小, 动作序列长度, 动作维度]
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
+        # 通过前缀部分的前向传播填充 Key-Value 缓存
+        # 获取前缀部分的的tokens、掩码和自回归掩码
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        # 创建前缀部分的注意力掩码，形状为[批次大小, 前缀长度, 前缀长度]，指示前缀tokens之间的注意力
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        # 计算位置编码
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        # 通过PaLI-Gemma模型处理前缀tokens，得到前缀部分的输出和KV缓存
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
-            x_t, time = carry
+            """定义单步去噪函数"""
+            x_t, time = carry 
             suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -349,5 +400,6 @@ class Pi0(_model.BaseModel):
             # robust to floating-point error
             return time >= -dt / 2
 
+        # 使用while循环进行迭代采样，从t=1（噪声）开始
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0

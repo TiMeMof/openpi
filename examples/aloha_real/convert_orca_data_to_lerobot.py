@@ -8,7 +8,8 @@ from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import tyro
 
-from orca_gym.robomimic.dataset_util import DatasetReader
+# from .robomimic.dataset_util import DatasetReader
+from openpi.dataset_util import DatasetReader
 import dataclasses
 import argparse
 import numpy as np
@@ -78,7 +79,7 @@ def main(args) -> None:
                     # "observation.effort": demo_data["obs"]["effort"][step],
                 }
             )
-
+        # demo_data["language_instruction"] = "grip the bottle"
         dataset.save_episode(task=demo_data["language_instruction"].decode("utf-8"))
 
     # Consolidate the dataset, skip computing stats since we will do that later
