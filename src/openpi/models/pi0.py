@@ -366,18 +366,25 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             """定义单步去噪函数"""
-            x_t, time = carry 
+            x_t, time = carry # carry数组包含当前状态和时间
+            # 将时间广播到批次大小，并且嵌入后缀（批次和动作）
             suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
+            """构建复杂的注意力掩码系统，处理前缀-后缀之间的注意力关系
+            ——这个复杂的掩码系统允许后缀token（包括状态和动作）有选择地关注前缀token（图像和文本），
+            实现了条件生成"""
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
+            # 创建后缀对后缀的注意力掩码，形状为[批次, 后缀长度, 后缀长度]
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
+            # 创建后缀对前缀的注意力掩码，形状为[批次, 后缀长度, 前缀长度]
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
+            # 组合掩码，形状为[批次, 后缀长度, 前缀长度 + 后缀长度]
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
                 batch_size,
@@ -385,19 +392,28 @@ class Pi0(_model.BaseModel):
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
+            # 计算位置编码，为后缀token计算其在完整序列中的位置
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
+            # 使用KV缓存进行高效的前向传递
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens], mask=full_attn_mask, positions=positions, kv_cache=kv_cache
             )
+            # 确保前缀输出为None，因为使用了KV缓存
             assert prefix_out is None
+            # 这里action_horizon是50，表示动作序列长度，
+            # suffix_out[:, -self.action_horizon :]表示取后缀输出的最后50个token
+            # action_out_proj是一个线性层，将后缀输出投影到动作维度
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+            # v_t是预测的噪声，dt这里是负的，表示时间从1到0
+            # 所以这里 x_t+dt*v_t 是去噪后的动作
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
             x_t, time = carry
             # robust to floating-point error
+            # 迭代条件：时间大于等于-dt/2，注：这里的dt是负数
             return time >= -dt / 2
 
         # 使用while循环进行迭代采样，从t=1（噪声）开始
