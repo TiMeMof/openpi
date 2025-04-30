@@ -417,5 +417,6 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         # 使用while循环进行迭代采样，从t=1（噪声）开始
+        # carry首次为噪声noise和1.0（时间）
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
